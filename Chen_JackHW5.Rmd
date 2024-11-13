@@ -9,3 +9,235 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+```{r library and data, include=FALSE}
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(tigris)
+library(gganimate)
+library(riem)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(mapview)
+library(sfdep)
+library(spdep)
+library(caret)
+library(readr)
+
+options(tigris_class = "sf")
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+p4 = c("#f8b195", "#f2727f", "#6b5b7b", "#355e7e")
+```
+
+```{r census api, include=FALSE}
+census_api_key("0e028dfcee38f844e89c39d01870f6a964f675a2", overwrite = TRUE, install = TRUE)
+```
+
+```{r read csv}
+chibikes = read.csv("https://raw.githubusercontent.com/jijinjc/musa-5080-hw-5b/refs/heads/main/Divvy_Trips_20241111.csv") %>%
+  rename(FROM.LAT = FROM.LATITUDE,
+         FROM.LONG = FROM.LONGITUDE,
+         TO.LAT = TO.LATITUDE,
+         TO.LONG = TO.LONGITUDE)
+```
+
+```{r census}
+chicensus = get_acs(geography = "tract", 
+          variables = c("B01003_001", "B19013_001", 
+                        "B02001_002", "B08013_001",
+                        "B08012_001", "B08301_001", 
+                        "B08301_010", "B01002_001"), 
+          year = 2019, 
+          state = "IL", 
+          geometry = TRUE, 
+          county="Cook",
+          output = "wide") %>%
+  rename(Total_Pop =  B01003_001E,
+         Med_Inc = B19013_001E,
+         Med_Age = B01002_001E,
+         White_Pop = B02001_002E,
+         Travel_Time = B08013_001E,
+         Num_Commuters = B08012_001E,
+         Means_of_Transport = B08301_001E,
+         Total_Public_Trans = B08301_010E) %>%
+  select(Total_Pop, Med_Inc, White_Pop, Travel_Time,
+         Means_of_Transport, Total_Public_Trans,
+         Med_Age,
+         GEOID, geometry) %>%
+  mutate(Percent_White = White_Pop / Total_Pop,
+         Mean_Commute_Time = Travel_Time / Total_Public_Trans,
+         Percent_Taking_Public_Trans = Total_Public_Trans / Means_of_Transport)
+
+chitracts = chicensus %>%
+  as.data.frame() %>%
+  distinct(GEOID, .keep_all = TRUE) %>%
+  select(GEOID, geometry) %>% 
+  st_sf()
+```
+
+```{r add census tract}
+chibc <- st_join(chibikes %>% 
+                         filter(is.na(FROM.LAT) == FALSE &
+                                is.na(FROM.LONG) == FALSE &
+                                is.na(TO.LAT) == FALSE &
+                                is.na(TO.LONG) == FALSE) %>%
+                         st_as_sf(., coords = c("FROM.LONG", "FROM.LAT"), crs = 4326),
+                       chitracts %>%  st_transform(crs=4326),
+                       join=st_intersects, left = TRUE) %>%
+  mutate(FROM.LONG = unlist(map(geometry, 1)),
+         FROM.LAT = unlist(map(geometry, 2)))%>%
+  as.data.frame()
+```
+
+```{r location of start, fig.height=8, fig.width=5}
+ggplot()+
+  geom_sf(data = chitracts %>%
+          st_transform(crs=4326), fill="white")+
+  geom_point(data = chibc, aes(x=FROM.LONG, y = FROM.LAT), 
+            color = "#4a53e0", alpha = 1, size = 1) + 
+  ylim(min(chibc$FROM.LAT), max(chibc$FROM.LAT))+
+  xlim(min(chibc$FROM.LONG), max(chibc$FROM.LONG)) +
+  labs(title = "Location of Rides Starting\nPoints in Chicago") +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks =element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, linewidth=0.8)
+        )
+```
+
+```{r}
+chibc = chibc %>%
+  mutate(
+    interval60 = floor_date(mdy_hms(START.TIME), unit = "hour"),
+    interval15 = floor_date(mdy_hms(START.TIME), unit = "15 mins"),
+    week = week(interval60),
+    dotw = wday(interval60, label = TRUE, abbr = TRUE, locale = "en_US")
+  ) %>%
+  mutate(
+    TIME.CAT = case_when(
+      hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+      hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+      hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+      hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush"
+    )
+  ) %>%
+  mutate(
+    hour = hour(mdy_hms(START.TIME)),
+    weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday")
+  )
+```
+
+```{r}
+routes <- st_sfc(
+  lapply(1:nrow(chibc), function(i) {
+    st_linestring(matrix(c(chibc[i, "FROM.LONG"], chibc[i, "FROM.LAT"],
+                            chibc[i, "TO.LONG"], chibc[i, "TO.LAT"]), ncol = 2, byrow = TRUE))
+  }))
+
+routes_sf <- st_sf(geometry = routes)
+routes_sf <- st_set_crs(routes_sf, 4326)
+
+Route <- routes_sf %>% head(200)
+mapview(Route, zcol = NULL, color = "#4a53e0", linewidth = 0.001, alpha = 0.3)
+```
+
+```{r bike share trips, fig.width=8, fig.height=5}
+ggplot(chibc %>%
+         group_by(interval60) %>%
+         tally())+
+  geom_line(aes(x = interval60, y = n), color= "#4a53e0")+
+  labs(title="Bike Share Trips Per Hour in Chicago, 2019 Jan to Feb",
+       x="Date", 
+       y="Number of trips") + 
+theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=8), 
+        axis.title=element_text(size=10), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, linewidth =0.8))
+```
+
+```{r visualization 2, fig.width=8, fig.height=5}
+ggplot(chibc %>%
+         group_by(interval60, FROM.STATION.NAME) %>%
+         tally())+
+  geom_histogram(aes(n), binwidth = 5, fill="#4a53e0")+
+  labs(title="Bike Share Trips Per Hour by Station in Chicago, 2019 Jan to Feb",
+       x="Trip Counts", 
+       y="Number of Stations") + 
+    theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=8), 
+        axis.title=element_text(size=10), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, linewidth =0.8))
+```
+
+```{r}
+chibc %>%
+        group_by(interval60, FROM.STATION.NAME, TIME.CAT) %>%
+         tally()%>%
+  group_by(FROM.STATION.NAME, TIME.CAT)%>%
+  summarize(mean_trips = mean(n))%>%
+  ggplot()+
+  geom_histogram(aes(mean_trips, fill=TIME.CAT), binwidth = 1)+
+  scale_fill_manual(values = p4, name="Time of Day") + 
+  labs(title="Mean Number of Hourly Trips Per Station",
+       x="Number of trips", 
+       y="Frequency")+
+  facet_wrap(~TIME.CAT) +
+theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=8), 
+        axis.title=element_text(size=10), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8))
+```
+
+```{r weekday vis}
+ggplot(chibc %>% mutate(hour = hour(mdy_hms(START.TIME))))+
+     geom_freqpoly(aes(hour, color = dotw), binwidth = 3, lwd = 0.8)+
+  scale_color_manual(values = c("#72197d", "#d3385b", "#f0d04d", "#ca3a91", "#407c23","#e58839", "#2c1af2"), name = "Day") + 
+  labs(title="Bike Share Trips in Jersey City by Day of the Week, Aug 2023",
+       x="Hour", 
+       y="Trip Counts") + 
+  theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=8), 
+        axis.title=element_text(size=10), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8))
+```
+
+```{r}
+ggplot(chibc)+
+     geom_freqpoly(aes(hour, color = weekend), binwidth = 3, lwd = 1.2)+
+  scale_color_manual(values= c("#f0d04d","#72197d")) + 
+  labs(color = "Time of Week") +
+  labs(title="Bike Share Trips in Jersey City - Weekend vs Weekday, Aug 2023",
+       x="Hour", 
+       y="Trip Counts") + 
+  theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=8), 
+        axis.title=element_text(size=10), 
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.8))
+```
+
+
+
+
